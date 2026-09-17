@@ -1,188 +1,419 @@
 """
-Reasoning-stripping proxy for llama-cpp-python's OpenAI server.
+Reasoning-stripping proxy for OpenAI-compatible llama.cpp servers.
 
 Why this exists
 ---------------
-The Qwen3 chat template baked into the GGUF ends the generation prompt with
-a literal "<think>\n". The model therefore starts generating *inside* the
-reasoning block and only ever emits the CLOSING "</think>" tag.
+Local runners (llama-cpp-python 0.3.x, older llama-server builds, anything
+without a reasoning parser for the model you loaded) hand back the raw
+completion, so the chain of thought ends up in `choices[].message.content`
+and every frontend renders it as part of the reply.
 
-llama-cpp-python (0.3.x) has no reasoning parser at all -- it hands back the
-raw completion -- so the OpenAI response looks like:
+It leaks in several different shapes:
 
-    choices[0].message.content == "okay so the user wants...</think>\n\nHere is the answer."
+  * Qwen3 / DeepSeek-R1 / QwQ / GLM / Phi-4-reasoning / Nemotron and the
+    Gemma "thinking" finetunes wrap it in <think>...</think> -- and because
+    the chat template ends the prompt with a literal "<think>\n", the model
+    often emits ONLY the closing tag.
+  * Magistral uses [THINK], Cohere uses <|START_THINKING|>, Kimi uses
+    the fullwidth triangle variant, Seed-OSS uses <seed:think>, EXAONE Deep
+    uses <thought>, the Unsloth-style Gemma reasoning tunes use
+    <start_working_out>.
+  * gpt-oss uses no tags at all. It uses harmony channels:
+        <|channel|>analysis<|message|>...<|end|>
+        <|start|>assistant<|channel|>final<|message|>the actual reply
+    Only the `final` channel is meant to be shown.
 
-i.e. the chain of thought leaks into `content`, with no opening tag to match on.
-
-This proxy sits in front of the llama.cpp server, splits on the first
-"</think>", and puts the reasoning in `reasoning_content` (DeepSeek/Qwen
-convention that OpenWebUI, SillyTavern, Cherry Studio, LibreChat, etc. render
-as a collapsible "thinking" panel) while `content` holds only the answer.
+This proxy sits in front of the upstream server and filters all of those out
+of `content`, streaming and non-streaming, for every block in the message --
+not just the first one.
 
 Modes (env REASONING_MODE, or per-request "reasoning_mode" in the JSON body):
     separate  (default) -> reasoning moved to `reasoning_content`
     drop                -> reasoning discarded entirely
     raw                 -> passthrough, no rewriting (for debugging)
+
+Other env knobs:
+    UPSTREAM          base url of the real server (default http://127.0.0.1:8000)
+    PREFILL_THINK     auto (default) | yes | no
+                      How to treat text before any marker is seen.
+                      auto: hold it back; a closing tag with no opener means
+                            it was a prefilled thought, otherwise it is content.
+                      yes:  the template definitely prefills "<think>" (Qwen).
+                      no:   never assume a prefill -- lowest latency, streams
+                            from the first token, only strips explicit blocks.
+    ON_UNCLOSED       drop (default) | keep
+                      What to do when the stream ends inside a thought
+                      (max_tokens too low). `drop` means a truncated reply
+                      comes back empty instead of leaking -- raise max_tokens.
+    STREAM_REASONING  1 (default) -> reasoning_content streams live
+                      0            -> held and sent in one delta at </think>
+    SCRUB_HISTORY     1 (default) -> strip leaked thoughts out of the assistant
+                      turns the client sends back up (Janitor keeps them)
+    CORS_ORIGINS      * (default) -- Janitor AI calls this from the browser
+
+Janitor AI notes
+----------------
+Janitor is a browser app, so it needs CORS headers (added below) and it will
+happily be pointed at a url without the /v1 prefix, so both /chat/completions
+and /v1/chat/completions are handled. Janitor does not render
+`reasoning_content`, so `separate` and `drop` look identical there.
 """
 
 import json
 import os
+import re
 
 import httpx
 from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 UPSTREAM = os.environ.get("UPSTREAM", "http://127.0.0.1:8000").rstrip("/")
 DEFAULT_MODE = os.environ.get("REASONING_MODE", "separate")
-# Stream the chain of thought token-by-token as it is produced. Off by default:
-# see StreamSplitter.feed for why holding it back is safer.
-STREAM_REASONING = os.environ.get("STREAM_REASONING", "0") not in ("0", "", "false")
+PREFILL_THINK = os.environ.get("PREFILL_THINK", "auto").lower()
+ON_UNCLOSED = os.environ.get("ON_UNCLOSED", "drop").lower()
+SCRUB_HISTORY = os.environ.get("SCRUB_HISTORY", "1") not in ("0", "", "false")
+CORS_ORIGINS = os.environ.get("CORS_ORIGINS", "*")
+# Truncated thoughts can only be recovered if the reasoning was withheld, so
+# ON_UNCLOSED=keep forces the non-streaming variant.
+STREAM_REASONING = (os.environ.get("STREAM_REASONING", "1") not in ("0", "", "false")
+                    and ON_UNCLOSED != "keep")
 TIMEOUT = httpx.Timeout(connect=10.0, read=None, write=None, pool=None)
 
-OPEN, CLOSE = "<think>", "</think>"
+# ---------------------------------------------------------------------------
+# Markers
+#
+# kind:
+#   "hide"        start of a thought. Text seen before it (while undecided)
+#                 was real content.
+#   "show"        end of a thought / start of the visible answer. Text seen
+#                 before it (while undecided) was a prefilled thought.
+#   "hide_close"  ends a hidden region AND starts another one. Harmony's
+#                 <|end|> / <|start|> sit between channels, so anything
+#                 before them was reasoning, and what follows is still not
+#                 the answer until a `final` channel opens.
+#   "drop"        strip the marker, do not change state.
+# ---------------------------------------------------------------------------
+MARKERS = [
+    # Qwen3, DeepSeek-R1, QwQ, GLM-4.5/4.6, Phi-4-reasoning, Nemotron,
+    # Gemma thinking finetunes, and most community reasoning tunes.
+    ("<think>", "hide"), ("</think>", "show"),
+    ("<thinking>", "hide"), ("</thinking>", "show"),
+    ("<thought>", "hide"), ("</thought>", "show"),            # EXAONE Deep
+    ("<reasoning>", "hide"), ("</reasoning>", "show"),
+    ("<reflection>", "hide"), ("</reflection>", "show"),
+    # Mistral / Magistral
+    ("[THINK]", "hide"), ("[/THINK]", "show"),
+    # Cohere Command A / Command R7B
+    ("<|START_THINKING|>", "hide"), ("<|END_THINKING|>", "show"),
+    ("<|START_RESPONSE|>", "drop"), ("<|END_RESPONSE|>", "drop"),
+    # Moonshot Kimi (fullwidth triangles, not ASCII angle brackets)
+    ("◁think▷", "hide"), ("◁/think▷", "show"),
+    # ByteDance Seed-OSS
+    ("<seed:think>", "hide"), ("</seed:think>", "show"),
+    # Unsloth / Gemma-style reasoning finetunes
+    ("<start_working_out>", "hide"), ("<end_working_out>", "show"),
+    ("<SOLUTION>", "drop"), ("</SOLUTION>", "drop"),
+    # Sky-T1 / OpenThoughts
+    ("<|begin_of_thought|>", "hide"), ("<|end_of_thought|>", "show"),
+    ("<|begin_of_solution|>", "drop"), ("<|end_of_solution|>", "drop"),
+    # gpt-oss / harmony. `final` is the only channel the user should see;
+    # the bare <|channel|> catches analysis and commentary.
+    ("<|channel|>final<|message|>", "show"),
+    ("<|channel|>", "hide"),
+    ("<|message|>", "drop"),
+    ("<|constrain|>", "drop"),
+    ("<|end|>", "hide_close"),
+    ("<|start|>", "hide_close"),
+    ("<|call|>", "hide_close"),
+    ("<|return|>", "hide_close"),
+]
 
-app = FastAPI(title="think-stripping proxy")
+_KIND = {lit.lower(): kind for lit, kind in MARKERS}
+# Harmony writes a short header between the channel marker and <|message|>
+# ("analysis", "assistant", "commentary to=functions.f"). It is routing
+# metadata, not thought, so it is thrown away rather than kept as reasoning.
+_HEADER_OPEN = {"<|channel|>", "<|start|>"}
+_HEADER_KEEP = {"<|constrain|>"}
+# Longest alternative first so the leftmost match is also the longest one
+# (<|channel|>final<|message|> must win over a bare <|channel|>).
+_PATTERN = re.compile(
+    "|".join(re.escape(lit) for lit, _ in sorted(MARKERS, key=lambda m: -len(m[0]))),
+    re.IGNORECASE,
+)
+# Every proper prefix of every marker, for holding back a marker that got
+# split across two SSE chunks.
+_PREFIXES = {lit[:i].lower() for lit, _ in MARKERS for i in range(1, len(lit))}
+_MAXLEN = max(len(lit) for lit, _ in MARKERS)
 
 
-def split_reasoning(text: str):
-    """Return (reasoning, answer, found_close_tag)."""
-    idx = text.find(CLOSE)
-    if idx == -1:
-        # No closing tag: generation was cut off mid-thought (max_tokens too
-        # low), or thinking was disabled. Leave the text alone rather than
-        # returning an empty message.
-        return "", text, False
-    head, tail = text[:idx], text[idx + len(CLOSE):]
-    prefix = ""
-    o = head.find(OPEN)
-    if o != -1:  # model re-emitted the opening tag
-        prefix, head = head[:o], head[o + len(OPEN):]
-    return head.strip("\n"), (prefix + tail).lstrip("\n"), True
+class ThinkFilter:
+    """Incremental chain-of-thought stripper.
 
+    feed() takes any slice of the completion and returns
+    (reasoning_delta, content_delta); flush() finishes the message.
+    """
 
-class StreamSplitter:
-    """Incremental version of split_reasoning for SSE deltas."""
+    UNDECIDED, HIDDEN, VISIBLE = 0, 1, 2
 
-    def __init__(self, stream_reasoning: bool = False):
+    def __init__(self, start=None, stream_reasoning=True, on_unclosed="drop"):
+        if start is None:
+            start = {"yes": self.HIDDEN, "no": self.VISIBLE}.get(
+                PREFILL_THINK, self.UNDECIDED)
+        self.state = start
         self.stream_reasoning = stream_reasoning
-        self.held = ""
-        self.buf = ""
-        self.in_reasoning = True
-        self.saw_open = False
-        self.pending_lstrip = True
-        self.reasoning_so_far = ""
+        self.on_unclosed = on_unclosed
+        self.buf = ""       # unprocessed tail (may hold a partial marker)
+        self.held = ""      # text buffered while UNDECIDED
+        self.pending = ""   # reasoning withheld when stream_reasoning is off
+        self.r_out = []
+        self.c_out = []
+        self.lstrip_reason = True
+        self.lstrip_content = True
+        self.saw_content = False
+        self.in_header = False
+        self.saw_marker = False
 
-    def feed(self, piece: str):
-        """Return (reasoning_delta, content_delta).
-
-        By default the reasoning is held back until "</think>" actually
-        arrives, then released in one delta. That way a stream that ends
-        mid-thought (truncated, or thinking disabled) can be flushed as
-        ordinary content instead of being mislabelled as reasoning."""
-        was_reasoning = self.in_reasoning
-        reasoning, content = self._feed(piece)
+    # -- emit helpers -------------------------------------------------------
+    def _reason(self, s):
+        if not s:
+            return
+        if self.lstrip_reason:
+            s = s.lstrip("\n")
+            if not s:
+                return
+            self.lstrip_reason = False
         if self.stream_reasoning:
-            return reasoning, content
-        if was_reasoning and self.in_reasoning:
-            self.held += reasoning
-            return "", content
-        if was_reasoning:  # just closed
-            reasoning, self.held = self.held + reasoning, ""
-        return reasoning, content
+            self.r_out.append(s)
+        else:
+            self.pending += s
 
-    def _feed(self, piece: str):
-        if not self.in_reasoning:
-            return "", self._lstrip_once(piece)
+    def _content(self, s):
+        if not s:
+            return
+        if self.lstrip_content:
+            s = s.lstrip("\n")
+            if not s:
+                return
+            self.lstrip_content = False
+        self.saw_content = True
+        self.c_out.append(s)
 
-        self.buf += piece
+    def _text(self, s):
+        if not s or self.in_header:
+            return
+        if self.state == self.UNDECIDED:
+            self.held += s
+        elif self.state == self.HIDDEN:
+            self._reason(s)
+        else:
+            self._content(s)
 
-        # Decide once whether the reasoning opens with a literal "<think>".
-        # The tag may be split across SSE chunks, so wait until there are
-        # enough characters to tell.
-        if not self.saw_open:
-            lead = self.buf.lstrip()
-            if lead.startswith(OPEN):
-                self.buf = lead[len(OPEN):].lstrip("\n")
-                self.saw_open = True
-            elif len(lead) < len(OPEN) and OPEN.startswith(lead):
-                return "", ""  # still ambiguous
+    # -- state transitions --------------------------------------------------
+    def _go_hidden(self, held_was_reasoning):
+        if self.state == self.UNDECIDED:
+            head, self.held = self.held, ""
+            if held_was_reasoning:
+                self.state = self.HIDDEN
+                self._reason(head)
             else:
-                self.saw_open = True
+                self.state = self.VISIBLE
+                self._content(head)
+        self.state = self.HIDDEN
+        self.lstrip_reason = True
 
-        idx = self.buf.find(CLOSE)
-        if idx != -1:
-            head = self._lead(self.buf[:idx].rstrip("\n"))
-            tail = self.buf[idx + len(CLOSE):]
-            self.in_reasoning = False
-            self.buf = ""
-            self.reasoning_so_far += head
-            return head, self._lstrip_once(tail)
+    def _go_visible(self):
+        if self.state == self.UNDECIDED:
+            # A closing tag with nothing opening it: the template prefilled
+            # the opener, so everything so far was the thought.
+            head, self.held = self.held, ""
+            self.state = self.HIDDEN
+            self._reason(head)
+        if self.pending:
+            self.r_out.append(self.pending)
+            self.pending = ""
+        self.state = self.VISIBLE
+        self.lstrip_content = True
 
-        # Hold back any suffix that could be the start of a split "</think>",
-        # and any whitespace right before it, so `reasoning_content` does not
-        # end with the newline that precedes the closing tag.
-        keep = 0
-        for k in range(min(len(CLOSE) - 1, len(self.buf)), 0, -1):
-            if self.buf.endswith(CLOSE[:k]):
-                keep = k
+    # -- driving ------------------------------------------------------------
+    def _drain(self, final):
+        while True:
+            m = _PATTERN.search(self.buf)
+            if not m:
                 break
-        cut = len(self.buf) - keep
-        cut -= len(self.buf[:cut]) - len(self.buf[:cut].rstrip())
-        emit, self.buf = self._lead(self.buf[:cut]), self.buf[cut:]
-        self.reasoning_so_far += emit
-        return emit, ""
+            rest = self.buf[m.start():]
+            if not final and len(rest) < _MAXLEN and rest.lower() in _PREFIXES:
+                # A complete marker that is also the start of a longer one:
+                # "<|channel|>" may still turn into "<|channel|>final<|message|>",
+                # which means the opposite thing. Wait for more tokens.
+                break
+            self._text(self.buf[:m.start()])
+            self.buf = self.buf[m.end():]
+            lit = m.group(0).lower()
+            kind = _KIND[lit]
+            self.saw_marker = True
+            if lit not in _HEADER_KEEP:
+                self.in_header = lit in _HEADER_OPEN
+            if kind == "hide":
+                self._go_hidden(False)
+            elif kind == "hide_close":
+                self._go_hidden(True)
+            elif kind == "show":
+                self._go_visible()
+            # "drop": marker removed, state untouched
 
-    def _lead(self, s: str) -> str:
-        """Drop the newline(s) that follow an opening <think> tag."""
-        return s.lstrip("\n") if not self.reasoning_so_far else s
+        if final:
+            self._text(self.buf)
+            self.buf = ""
+            return
+        # Hold back a suffix that could be the front of a split marker, plus
+        # the whitespace in front of it, so a thought does not end with the
+        # newline that precedes its closing tag.
+        cut = len(self.buf) - self._partial_len(self.buf)
+        while cut > 0 and self.buf[cut - 1] in " \t\r\n":
+            cut -= 1
+        self._text(self.buf[:cut])
+        self.buf = self.buf[cut:]
 
-    def flush(self) -> str:
-        """Called at end of stream. If "</think>" never arrived, thinking was
-        either off or the generation was truncated mid-thought -- return the
-        whole text so the client is never left with an empty message."""
-        if not self.in_reasoning:
-            return ""
-        text = self.reasoning_so_far + self.buf
-        self.in_reasoning = False
-        self.buf = self.held = ""
-        return text
+    def feed(self, piece):
+        self.buf += piece
+        self._drain(final=False)
+        return self._take()
 
-    def _lstrip_once(self, s: str) -> str:
-        """Swallow the blank line the template puts after </think>."""
-        if not self.pending_lstrip:
-            return s
-        s = s.lstrip("\n")
-        if s:
-            self.pending_lstrip = False
-        return s
+    def flush(self, truncated=False):
+        """End of message. `truncated` is finish_reason == "length", i.e. the
+        model hit max_tokens. Returns the final (reasoning, content) deltas."""
+        self.in_header = False
+        self._drain(final=True)
+        if self.state == self.UNDECIDED:
+            head, self.held = self.held, ""
+            if truncated and not self.saw_marker and PREFILL_THINK == "auto":
+                # Cut off by max_tokens with no marker anywhere in the output.
+                # A template that ends the prompt with a literal "<think>" makes
+                # exactly this shape: the model is still inside the thought it
+                # was handed, so there is no opening tag to find and no closing
+                # tag was ever reached. Textually identical to a model that just
+                # did not think -- finish_reason is the only thing that tells
+                # them apart. Treat it as a thought rather than print it.
+                self.state = self.HIDDEN
+                self._reason(head)
+                self._end_unclosed()
+            else:
+                self.state = self.VISIBLE
+                self._content(head)
+        elif self.state == self.HIDDEN:
+            # Stopped inside an explicitly opened thought. Never fall back to
+            # printing it -- that was the old behaviour and it is the leak.
+            self._end_unclosed()
+        return self._take()
+
+    def _end_unclosed(self):
+        if self.pending:
+            if self.on_unclosed == "keep":
+                self.state = self.VISIBLE
+                self.lstrip_content = True
+                self._content(self.pending)
+            else:
+                # Still reasoning, just unfinished -- surface it in
+                # reasoning_content rather than discarding it silently, so the
+                # non-streaming path matches the streaming one.
+                self.r_out.append(self.pending)
+        self.pending = ""
+        self.state = self.VISIBLE
+
+    def _take(self):
+        r, c = "".join(self.r_out), "".join(self.c_out)
+        self.r_out, self.c_out = [], []
+        return r, c
+
+    @staticmethod
+    def _partial_len(buf):
+        low = buf.lower()
+        n = len(low)
+        for k in range(min(_MAXLEN - 1, n), 0, -1):
+            if low[n - k:] in _PREFIXES:
+                return k
+        return 0
 
 
-def _apply(msg: dict, mode: str) -> None:
-    content = msg.get("content")
-    if not isinstance(content, str):
+def strip_reasoning(text, truncated=False, **kw):
+    """Whole-string version. Returns (reasoning, content)."""
+    f = ThinkFilter(**kw)
+    r1, c1 = f.feed(text)
+    r2, c2 = f.flush(truncated)
+    return r1 + r2, c1 + c2
+
+
+# ---------------------------------------------------------------------------
+# HTTP
+# ---------------------------------------------------------------------------
+app = FastAPI(title="think-stripping proxy")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[o.strip() for o in CORS_ORIGINS.split(",")] if CORS_ORIGINS != "*" else ["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+    expose_headers=["*"],
+)
+
+_DROP_HEADERS = {"host", "content-length", "connection", "accept-encoding",
+                 "origin", "referer", "cookie"}
+
+
+def _hop_headers(req):
+    return {k: v for k, v in req.headers.items()
+            if k.lower() not in _DROP_HEADERS and not k.lower().startswith("sec-")}
+
+
+def _new_filter():
+    return ThinkFilter(stream_reasoning=STREAM_REASONING, on_unclosed=ON_UNCLOSED)
+
+
+def _apply(obj, key, mode, truncated=False):
+    """Filter obj[key] in place (message.content or completion text)."""
+    text = obj.get(key)
+    if not isinstance(text, str) or not text:
         return
-    reasoning, answer, found = split_reasoning(content)
-    if not found:
-        return
-    msg["content"] = answer
+    reasoning, answer = strip_reasoning(
+        text, truncated=truncated, stream_reasoning=False,
+        on_unclosed=ON_UNCLOSED)
+    obj[key] = answer
     if mode == "separate" and reasoning:
-        msg["reasoning_content"] = reasoning
+        obj["reasoning_content"] = (obj.get("reasoning_content") or "") + reasoning
+    elif mode == "drop":
+        obj.pop("reasoning_content", None)
 
 
-def _hop_headers(req: Request) -> dict:
-    drop = {"host", "content-length", "connection", "accept-encoding"}
-    return {k: v for k, v in req.headers.items() if k.lower() not in drop}
+def _scrub_request(body):
+    """Janitor (and most frontends) replay the whole chat every turn. If a
+    thought leaked once it comes straight back up in the history, so clean the
+    assistant turns on the way in."""
+    for msg in body.get("messages") or []:
+        if not isinstance(msg, dict) or msg.get("role") != "assistant":
+            continue
+        msg.pop("reasoning_content", None)
+        content = msg.get("content")
+        if isinstance(content, str) and content:
+            _, msg["content"] = strip_reasoning(content, stream_reasoning=False)
+        elif isinstance(content, list):
+            for part in content:
+                if isinstance(part, dict) and isinstance(part.get("text"), str):
+                    _, part["text"] = strip_reasoning(
+                        part["text"], stream_reasoning=False)
 
 
-@app.post("/v1/chat/completions")
-async def chat_completions(request: Request):
+async def _handle_completions(request, path, chat):
     body = await request.json()
     mode = body.pop("reasoning_mode", DEFAULT_MODE)
-    headers = _hop_headers(request)
-    url = f"{UPSTREAM}/v1/chat/completions"
-
     if mode == "raw":
-        return await _passthrough(request, "/v1/chat/completions", body)
+        return await _passthrough(request, path, body)
+
+    if SCRUB_HISTORY and chat:
+        _scrub_request(body)
+
+    headers = _hop_headers(request)
+    url = f"{UPSTREAM}{path}"
+    key = "message" if chat else None
 
     if not body.get("stream"):
         async with httpx.AsyncClient(timeout=TIMEOUT) as client:
@@ -192,8 +423,11 @@ async def chat_completions(request: Request):
                             media_type=r.headers.get("content-type"))
         data = r.json()
         for ch in data.get("choices", []):
-            if isinstance(ch.get("message"), dict):
-                _apply(ch["message"], mode)
+            cut = ch.get("finish_reason") == "length"
+            if chat and isinstance(ch.get(key), dict):
+                _apply(ch[key], "content", mode, cut)
+            elif not chat:
+                _apply(ch, "text", mode, cut)
         return JSONResponse(data)
 
     # Connect eagerly so an upstream error (bad API key, model still loading)
@@ -210,8 +444,9 @@ async def chat_completions(request: Request):
                         media_type=upstream.headers.get("content-type"))
 
     async def gen():
-        splitters = {}
-        last_id, last_created, last_model = "chatcmpl-proxy", 0, body.get("model")
+        filters = {}
+        cut_off = set()
+        last = {"id": "chatcmpl-proxy", "created": 0, "model": body.get("model")}
         try:
             async for line in upstream.aiter_lines():
                 if not line.startswith("data: "):
@@ -221,20 +456,27 @@ async def chat_completions(request: Request):
 
                 payload = line[6:].strip()
                 if payload == "[DONE]":
-                    # Nothing ever closed the reasoning block: emit what we held
-                    # back as ordinary content so the reply is not empty.
-                    for idx, sp in splitters.items():
-                        leftover = sp.flush()
-                        if leftover:
-                            yield "data: " + json.dumps({
-                                "id": last_id,
-                                "object": "chat.completion.chunk",
-                                "created": last_created,
-                                "model": last_model,
-                                "choices": [{"index": idx,
-                                             "delta": {"content": leftover},
-                                             "finish_reason": None}],
-                            }) + "\n\n"
+                    for idx, f in filters.items():
+                        reasoning, content = f.flush(idx in cut_off)
+                        if not (reasoning or content):
+                            continue
+                        delta = {}
+                        if content:
+                            delta["content"] = content
+                        if reasoning and mode == "separate":
+                            delta["reasoning_content"] = reasoning
+                        if not delta:
+                            continue
+                        yield "data: " + json.dumps({
+                            "id": last["id"],
+                            "object": "chat.completion.chunk" if chat else "text_completion",
+                            "created": last["created"],
+                            "model": last["model"],
+                            "choices": [({"index": idx, "delta": delta,
+                                          "finish_reason": None} if chat else
+                                         {"index": idx, "text": delta.get("content", ""),
+                                          "finish_reason": None})],
+                        }) + "\n\n"
                     yield "data: [DONE]\n\n"
                     continue
 
@@ -244,23 +486,40 @@ async def chat_completions(request: Request):
                     yield f"{line}\n\n"
                     continue
 
-                last_id = chunk.get("id", last_id)
-                last_created = chunk.get("created", last_created)
-                last_model = chunk.get("model", last_model)
+                for k in last:
+                    if chunk.get(k) is not None:
+                        last[k] = chunk[k]
 
                 for ch in chunk.get("choices", []):
-                    delta = ch.get("delta")
-                    if not isinstance(delta, dict):
-                        continue
-                    piece = delta.get("content")
-                    if not isinstance(piece, str) or piece == "":
-                        continue
-                    sp = splitters.setdefault(
-                        ch.get("index", 0), StreamSplitter(STREAM_REASONING))
-                    reasoning, content = sp.feed(piece)
-                    delta["content"] = content or None
-                    if mode == "separate" and reasoning:
-                        delta["reasoning_content"] = reasoning
+                    if ch.get("finish_reason") == "length":
+                        cut_off.add(ch.get("index", 0))
+                    if chat:
+                        delta = ch.get("delta")
+                        if not isinstance(delta, dict):
+                            continue
+                        if mode == "drop":
+                            delta.pop("reasoning_content", None)
+                        piece = delta.get("content")
+                        if not isinstance(piece, str) or piece == "":
+                            continue
+                        f = filters.setdefault(ch.get("index", 0), _new_filter())
+                        reasoning, content = f.feed(piece)
+                        # Send no key at all rather than null: naive clients
+                        # concatenate the delta blindly and print "null".
+                        if content:
+                            delta["content"] = content
+                        else:
+                            delta.pop("content", None)
+                        if reasoning and mode == "separate":
+                            delta["reasoning_content"] = (
+                                delta.get("reasoning_content") or "") + reasoning
+                    else:
+                        piece = ch.get("text")
+                        if not isinstance(piece, str) or piece == "":
+                            continue
+                        f = filters.setdefault(ch.get("index", 0), _new_filter())
+                        _, content = f.feed(piece)
+                        ch["text"] = content
 
                 # Always forward the chunk, even when it is now empty: it keeps
                 # the SSE connection warm while the model is still thinking.
@@ -274,7 +533,7 @@ async def chat_completions(request: Request):
                                       "X-Accel-Buffering": "no"})
 
 
-async def _passthrough(request: Request, path: str, body=None):
+async def _passthrough(request, path, body=None):
     headers = _hop_headers(request)
     url = f"{UPSTREAM}{path}"
     content = json.dumps(body).encode() if body is not None else await request.body()
@@ -285,7 +544,23 @@ async def _passthrough(request: Request, path: str, body=None):
                     media_type=r.headers.get("content-type"))
 
 
+@app.get("/healthz")
+async def healthz():
+    return {"ok": True, "upstream": UPSTREAM, "mode": DEFAULT_MODE,
+            "prefill_think": PREFILL_THINK, "on_unclosed": ON_UNCLOSED}
+
+
 @app.api_route("/{path:path}",
                methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"])
 async def catch_all(request: Request, path: str):
-    return await _passthrough(request, f"/{path}")
+    # Match on the suffix, not the exact path: frontends get pointed at
+    # /v1/chat/completions, /chat/completions and /api/v1/chat/completions
+    # depending on what the user pasted into the box. Anything that falls
+    # through to a raw passthrough leaks the whole thought.
+    clean = "/" + path.strip("/")
+    if request.method == "POST":
+        if clean.endswith("/chat/completions"):
+            return await _handle_completions(request, clean, chat=True)
+        if clean.endswith("/completions"):
+            return await _handle_completions(request, clean, chat=False)
+    return await _passthrough(request, clean if path else "/")
