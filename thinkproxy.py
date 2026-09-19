@@ -126,6 +126,12 @@ MARKERS = [
     # opener ("thought") is not a routing decision. Matching only the
     # both-pipes "<|channel|>" form misses this entirely.
     ("<|channel>", "hide"), ("<channel|>", "show"),
+    # Gemma4's <|think|> is a MODE SWITCH injected into the first system turn
+    # ("Inject Thinking token at the very top of the FIRST system turn"), not a
+    # block delimiter -- the block is the <|channel> pair above. It should
+    # never appear in a completion, so strip it without changing state rather
+    # than treating it as an opener, which would hide the answer.
+    ("<|think|>", "drop"),
     ("<|think>", "hide"), ("<think|>", "show"),
     ("<|thinking>", "hide"), ("<thinking|>", "show"),
     ("<|thought>", "hide"), ("<thought|>", "show"),
