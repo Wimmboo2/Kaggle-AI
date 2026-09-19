@@ -62,6 +62,7 @@ and /v1/chat/completions are handled. Janitor does not render
 import json
 import os
 import re
+import sys
 
 import httpx
 from fastapi import FastAPI, Request
@@ -78,6 +79,7 @@ CORS_ORIGINS = os.environ.get("CORS_ORIGINS", "*")
 # ON_UNCLOSED=keep forces the non-streaming variant.
 STREAM_REASONING = (os.environ.get("STREAM_REASONING", "1") not in ("0", "", "false")
                     and ON_UNCLOSED != "keep")
+WARN_UNKNOWN = os.environ.get("WARN_UNKNOWN", "1") not in ("0", "", "false")
 TIMEOUT = httpx.Timeout(connect=10.0, read=None, write=None, pool=None)
 
 # ---------------------------------------------------------------------------
@@ -117,9 +119,19 @@ MARKERS = [
     # Sky-T1 / OpenThoughts
     ("<|begin_of_thought|>", "hide"), ("<|end_of_thought|>", "show"),
     ("<|begin_of_solution|>", "drop"), ("<|end_of_solution|>", "drop"),
-    # gpt-oss / harmony. `final` is the only channel the user should see;
-    # the bare <|channel|> catches analysis and commentary.
-    ("<|channel|>final<|message|>", "show"),
+    # Mirrored-pipe channel variant, observed in the wild:
+    #     <|channel>thought ...reasoning... <channel|>the answer
+    # The pipe sits inside-left to open and inside-right to close, so unlike
+    # canonical harmony below these ARE a plain pair and the name after the
+    # opener ("thought") is not a routing decision. Matching only the
+    # both-pipes "<|channel|>" form misses this entirely.
+    ("<|channel>", "hide"), ("<channel|>", "show"),
+    ("<|think>", "hide"), ("<think|>", "show"),
+    ("<|thinking>", "hide"), ("<thinking|>", "show"),
+    ("<|thought>", "hide"), ("<thought|>", "show"),
+    ("<|reasoning>", "hide"), ("<reasoning|>", "show"),
+    # gpt-oss / harmony proper. `final` is the only channel the user should
+    # see; the bare <|channel|> catches analysis and commentary.
     ("<|channel|>", "hide"),
     ("<|message|>", "drop"),
     ("<|constrain|>", "drop"),
@@ -130,11 +142,22 @@ MARKERS = [
 ]
 
 _KIND = {lit.lower(): kind for lit, kind in MARKERS}
-# Harmony writes a short header between the channel marker and <|message|>
-# ("analysis", "assistant", "commentary to=functions.f"). It is routing
-# metadata, not thought, so it is thrown away rather than kept as reasoning.
+# Harmony writes a short header between <|channel|> / <|start|> and
+# <|message|> -- "analysis", "assistant", "final", "commentary to=functions.f".
+# It is routing metadata rather than thought, and it is also the ONLY thing
+# that says whether the message body about to start is the answer or not:
+#
+#   <|start|>assistant<|channel|>analysis<|message|> thought  <|end|>
+#   <|start|>assistant<|channel|>final<|message|>    answer   <|return|>
+#
+# <|channel|> appears in both, so it cannot decide anything on its own. The
+# header is captured and read at <|message|>: `final` means show, anything
+# else means keep hiding. Matching the whole "<|channel|>final<|message|>"
+# run as one literal would break on any spacing variant, and breaking that
+# way hides the entire answer.
 _HEADER_OPEN = {"<|channel|>", "<|start|>"}
 _HEADER_KEEP = {"<|constrain|>"}
+_FINAL_CHANNEL = "final"
 # Longest alternative first so the leftmost match is also the longest one
 # (<|channel|>final<|message|> must win over a bare <|channel|>).
 _PATTERN = re.compile(
@@ -172,6 +195,7 @@ class ThinkFilter:
         self.lstrip_content = True
         self.saw_content = False
         self.in_header = False
+        self.header = None
         self.saw_marker = False
 
     # -- emit helpers -------------------------------------------------------
@@ -200,7 +224,10 @@ class ThinkFilter:
         self.c_out.append(s)
 
     def _text(self, s):
-        if not s or self.in_header:
+        if not s:
+            return
+        if self.in_header:
+            self.header = (self.header or "") + s
             return
         if self.state == self.UNDECIDED:
             self.held += s
@@ -252,8 +279,18 @@ class ThinkFilter:
             lit = m.group(0).lower()
             kind = _KIND[lit]
             self.saw_marker = True
+            if lit == "<|message|>" and self.header is not None:
+                # End of a harmony header: the name decides what follows.
+                name, self.header = self.header.strip().lower(), None
+                self.in_header = False
+                if name.startswith(_FINAL_CHANNEL):
+                    self._go_visible()
+                else:
+                    self._go_hidden(True)
+                continue
             if lit not in _HEADER_KEEP:
                 self.in_header = lit in _HEADER_OPEN
+                self.header = "" if self.in_header else None
             if kind == "hide":
                 self._go_hidden(False)
             elif kind == "hide_close":
@@ -284,6 +321,7 @@ class ThinkFilter:
         """End of message. `truncated` is finish_reason == "length", i.e. the
         model hit max_tokens. Returns the final (reasoning, content) deltas."""
         self.in_header = False
+        self.header = None
         self._drain(final=True)
         if self.state == self.UNDECIDED:
             head, self.held = self.held, ""
@@ -336,6 +374,25 @@ class ThinkFilter:
         return 0
 
 
+# Anything shaped like a special token: <|x|>, <|x>, <x|>. If one of these
+# reaches the client it is a marker this file does not know about, which is
+# how a leak starts. Name it on stderr so it can be added to MARKERS instead
+# of being rediscovered from a chat log.
+_SUSPECT = re.compile(r"<\|[^<>|\s]{1,24}\|?>|<[^<>|\s]{1,24}\|>")
+_WARNED = set()
+
+
+def warn_unknown(text):
+    if not (WARN_UNKNOWN and text):
+        return
+    for tok in _SUSPECT.findall(text):
+        if tok.lower() in _KIND or tok in _WARNED:
+            continue
+        _WARNED.add(tok)
+        print(f"[thinkproxy] unrecognised marker reached the client: {tok!r} "
+              f"-- add it to MARKERS", file=sys.stderr, flush=True)
+
+
 def strip_reasoning(text, truncated=False, **kw):
     """Whole-string version. Returns (reasoning, content)."""
     f = ThinkFilter(**kw)
@@ -377,6 +434,7 @@ def _apply(obj, key, mode, truncated=False):
     reasoning, answer = strip_reasoning(
         text, truncated=truncated, stream_reasoning=False,
         on_unclosed=ON_UNCLOSED)
+    warn_unknown(answer)
     obj[key] = answer
     if mode == "separate" and reasoning:
         obj["reasoning_content"] = (obj.get("reasoning_content") or "") + reasoning
@@ -507,6 +565,7 @@ async def _handle_completions(request, path, chat):
                         # Send no key at all rather than null: naive clients
                         # concatenate the delta blindly and print "null".
                         if content:
+                            warn_unknown(content)
                             delta["content"] = content
                         else:
                             delta.pop("content", None)
